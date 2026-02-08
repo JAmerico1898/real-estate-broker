@@ -1,8 +1,11 @@
 """
 Scraper de Coberturas - Lagoa, Rio de Janeiro
 ==============================================
-Roda no GitHub Actions com Playwright + Stealth.
-Salva resultados em dados/coberturas.json e envia push via Pushover.
+Estratégia:
+  1. Chama a API glue-api.zapimoveis.com.br diretamente (sem browser)
+  2. Se falhar, usa Playwright como fallback
+
+Roda no GitHub Actions. Salva em dados/coberturas.json.
 """
 
 import json
@@ -14,286 +17,196 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-import requests
-from playwright.sync_api import sync_playwright
-
-# Tenta importar stealth; se não tiver, segue sem
-try:
-    from playwright_stealth import stealth_sync
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
-    print("⚠️ playwright-stealth não instalado. Rodando sem stealth.")
+import requests as req
 
 # ============================================================
 # CONFIG
 # ============================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 FUSO = ZoneInfo("America/Sao_Paulo")
 PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
-URL_ZAP = (
-    "https://www.zapimoveis.com.br/venda/cobertura/"
-    "rj+rio-de-janeiro+zona-sul+lagoa/"
-    "?transacao=venda"
-    "&onde=%2CRio+de+Janeiro%2CRio+de+Janeiro%2CZona+Sul%2CLagoa"
-    "%2C%2C%2Cneighborhood%2CBR%3ERio+de+Janeiro%3ENULL%3ERio+de+Janeiro"
-    "%3EZona+Sul%3ELagoa%2C-22.96182%2C-43.203077%2C"
-    "&tipos=cobertura_residencial"
-)
-
 DADOS_DIR = Path("dados")
 HISTORICO_DIR = DADOS_DIR / "historico"
 COBERTURAS_FILE = DADOS_DIR / "coberturas.json"
 
+# API interna do Zap Imóveis (descoberta via interceptação de rede)
+GLUE_API_URL = "https://glue-api.zapimoveis.com.br/v2/listings"
 
-# ============================================================
-# COLETA
-# ============================================================
-def coletar():
-    """Coleta coberturas via Playwright com stealth."""
-    coberturas = []
-    api_responses = []
+# Parâmetros para coberturas à venda na Lagoa, Rio de Janeiro
+GLUE_API_PARAMS = {
+    "business": "SALE",
+    "listingType": "USED",
+    "unitTypes": "PENTHOUSE",
+    "addressNeighborhood": "Lagoa",
+    "addressCity": "Rio de Janeiro",
+    "addressState": "Rio de Janeiro",
+    "addressZone": "Zona Sul",
+    "addressLocationId": "BR>Rio de Janeiro>NULL>Rio de Janeiro>Zona Sul>Lagoa",
+    "addressPointLat": "-22.96182",
+    "addressPointLon": "-43.203077",
+    "addressType": "neighborhood",
+    "categoryPage": "RESULT",
+    "size": "100",
+    "from": "0",
+    "page": "1",
+    "includeFields": (
+        "search(result(listings(listing(displayAddressType,amenities,usableAreas,"
+        "constructionStatus,listingType,description,title,stamps,createdAt,"
+        "floors,unitTypes,nonActivationReason,providerId,propertyType,"
+        "unitSubTypes,unitsOnTheFloor,legacyId,id,portal,unitFloor,"
+        "parkingSpaces,updatedAt,address,suites,publicationType,"
+        "externalId,bathrooms,usageTypes,totalAreas,advertiserId,"
+        "advertiserContact,whatsappNumber,bedrooms,acceptExchange,"
+        "pricingInfos,showPrice,resale,buildings,capacityLimit,"
+        "status,ppiCategory,advertiserType),account(id,name,logoUrl,"
+        "licenseNumber,showAddress,legacyVivarealId,legacyZapId,"
+        "minisite),medias,accountLink,link)),totalCount))"
+    ),
+}
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ],
-        )
-
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            locale="pt-BR",
-            timezone_id="America/Sao_Paulo",
-            extra_http_headers={
-                "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-
-        page = context.new_page()
-
-        # Aplica stealth se disponível
-        if HAS_STEALTH:
-            stealth_sync(page)
-            logger.info("✅ Stealth aplicado")
-
-        # Intercepta respostas de rede
-        def on_response(response):
-            try:
-                url = response.url.lower()
-                keywords = [
-                    "listing", "search", "result", "property",
-                    "imovel", "glue", "bff", "api",
-                    "/v2/", "/v3/", "/v1/",
-                ]
-                if any(kw in url for kw in keywords) and response.status == 200:
-                    try:
-                        body = response.text()
-                        if body and len(body) > 200:
-                            data = json.loads(body)
-                            api_responses.append({
-                                "url": response.url,
-                                "data": data,
-                                "size": len(body),
-                            })
-                            logger.info(f"📡 API: {response.url[:100]} ({len(body):,}B)")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
-        # Acessa o site
-        logger.info("🌐 Acessando Zap Imóveis...")
-        page.goto(URL_ZAP, wait_until="domcontentloaded", timeout=60000)
-
-        # Verifica se caiu no Cloudflare
-        title = page.title()
-        logger.info(f"📄 Título: {title}")
-
-        if "cloudflare" in title.lower() or "attention" in title.lower():
-            logger.warning("🛡️ Cloudflare detectado! Aguardando challenge...")
-            # Espera mais tempo para o challenge resolver
-            page.wait_for_timeout(10000)
-            title = page.title()
-            logger.info(f"📄 Título após espera: {title}")
-
-            if "cloudflare" in title.lower() or "attention" in title.lower():
-                logger.error("❌ Cloudflare não foi contornado.")
-                page.screenshot(path="debug_cloudflare.png")
-                browser.close()
-                return []
-
-        # Espera carregamento
-        logger.info("⏳ Aguardando carregamento...")
-        page.wait_for_timeout(8000)
-
-        # Scroll para carregar mais
-        logger.info("📜 Scroll...")
-        for _ in range(8):
-            page.evaluate("window.scrollBy(0, window.innerHeight)")
-            page.wait_for_timeout(2000)
-
-        page.wait_for_timeout(3000)
-        logger.info(f"📡 APIs interceptadas: {len(api_responses)}")
-
-        # Processa APIs interceptadas
-        if api_responses:
-            coberturas = processar_apis(api_responses)
-
-        # Fallback: __NEXT_DATA__
-        if not coberturas:
-            logger.info("Tentando __NEXT_DATA__...")
-            coberturas = extrair_next_data(page)
-
-        # Fallback: HTML direto
-        if not coberturas:
-            logger.info("Tentando HTML...")
-            coberturas = extrair_html(page)
-
-        # Debug: salva screenshot se falhou
-        if not coberturas:
-            page.screenshot(path="debug_pagina.png")
-            html = page.content()
-            with open("debug_pagina.html", "w", encoding="utf-8") as f:
-                f.write(html)
-            logger.error(f"❌ Nenhuma cobertura. Título: {page.title()}")
-            logger.error(f"URL: {page.url}")
-            body_text = page.evaluate("() => document.body?.innerText?.substring(0, 500) || ''")
-            logger.error(f"Body: {body_text}")
-
-        browser.close()
-
-    logger.info(f"✅ Total: {len(coberturas)} coberturas")
-    return coberturas
+GLUE_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+    "Referer": "https://www.zapimoveis.com.br/",
+    "Origin": "https://www.zapimoveis.com.br",
+    "x-domain": "www.zapimoveis.com.br",
+}
 
 
 # ============================================================
-# PROCESSAMENTO
+# COLETA VIA API DIRETA
 # ============================================================
-def processar_apis(responses):
-    responses.sort(key=lambda x: x["size"], reverse=True)
-    for resp in responses:
-        found = buscar_listings(resp["data"])
-        if found:
-            logger.info(f"✅ {len(found)} coberturas via API: {resp['url'][:80]}")
-            return found
-    return []
+def coletar_via_api():
+    """Chama a API glue-api diretamente."""
+    logger.info("📡 Tentando API direta: glue-api.zapimoveis.com.br...")
+
+    todas_coberturas = []
+    page = 1
+    max_pages = 10
+
+    while page <= max_pages:
+        params = {**GLUE_API_PARAMS, "page": str(page), "from": str((page - 1) * 100)}
+
+        try:
+            response = req.get(
+                GLUE_API_URL,
+                params=params,
+                headers=GLUE_API_HEADERS,
+                timeout=30,
+            )
+
+            logger.info(f"  Página {page}: status {response.status_code} ({len(response.content):,}B)")
+
+            if response.status_code != 200:
+                logger.warning(f"  Resposta não-200: {response.status_code}")
+                break
+
+            data = response.json()
+
+            # Extrai listings
+            search = data.get("search", data)
+            result = search.get("result", search)
+            listings_data = result.get("listings", [])
+            total_count = result.get("totalCount", 0)
+
+            if not listings_data:
+                listings_data = data.get("listings", data.get("results", []))
+
+            if not listings_data:
+                logger.info(f"  Nenhum listing na página {page}")
+                break
+
+            logger.info(f"  {len(listings_data)} listings (total no site: {total_count})")
+
+            for item in listings_data:
+                listing = item.get("listing", item)
+                medias = item.get("medias", [])
+                link_data = item.get("link", {})
+
+                c = extrair_campos(listing, medias, link_data)
+                if c and c.get("preco"):
+                    todas_coberturas.append(c)
+
+            if len(listings_data) < 100 or len(todas_coberturas) >= total_count:
+                break
+
+            page += 1
+            time.sleep(1)
+
+        except req.exceptions.Timeout:
+            logger.error("  Timeout na API")
+            break
+        except req.exceptions.ConnectionError:
+            logger.error("  Erro de conexão")
+            break
+        except Exception as e:
+            logger.error(f"  Erro: {type(e).__name__}: {e}")
+            break
+
+    logger.info(f"📡 API direta: {len(todas_coberturas)} coberturas")
+    return todas_coberturas
 
 
-def buscar_listings(data, depth=0):
-    if depth > 6:
-        return []
-    chaves = ["listings", "results", "searchResults", "items", "hits", "data", "search"]
+def extrair_campos(listing, medias=None, link_data=None):
+    """Extrai campos de um listing da API glue."""
+    if not isinstance(listing, dict):
+        return None
 
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if any(c in key.lower() for c in chaves):
-                if isinstance(value, list) and value:
-                    parsed = parsear_lista(value)
-                    if parsed:
-                        return parsed
-                elif isinstance(value, dict):
-                    found = buscar_listings(value, depth + 1)
-                    if found:
-                        return found
-            elif isinstance(value, (dict, list)):
-                found = buscar_listings(value, depth + 1)
-                if found:
-                    return found
-    elif isinstance(data, list) and data:
-        return parsear_lista(data)
-    return []
-
-
-def parsear_lista(items):
-    coberturas = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        listing = item.get("listing", item)
-        if isinstance(listing, dict):
-            c = extrair_campos(listing)
-            if c:
-                coberturas.append(c)
-    return coberturas if any(c.get("preco") for c in coberturas) else []
-
-
-def extrair_campos(obj):
     c = {"endereco": "", "preco": "", "area_m2": "", "quartos": "", "vagas": "", "link": "", "foto": ""}
 
     # Endereço
-    addr = obj.get("address", {})
+    addr = listing.get("address", {})
     if isinstance(addr, dict):
         parts = [str(addr[k]) for k in ["street", "streetNumber", "neighborhood", "city"] if addr.get(k)]
         c["endereco"] = ", ".join(parts)
-    elif isinstance(addr, str):
-        c["endereco"] = addr
 
     # Preço
-    pricing = obj.get("pricingInfos", [])
+    pricing = listing.get("pricingInfos", [])
     if isinstance(pricing, list):
         for p in pricing:
-            if isinstance(p, dict):
-                val = p.get("price") or p.get("salePrice")
+            if isinstance(p, dict) and p.get("businessType") == "SALE":
+                val = p.get("price")
                 if val:
                     try:
                         n = int(str(val).replace(".", "").replace(",", ""))
                         c["preco"] = f"R$ {n:,.0f}".replace(",", ".")
                     except (ValueError, TypeError):
                         c["preco"] = f"R$ {val}"
-                    break
-    if not c["preco"]:
-        for k in ["price", "preco", "valor"]:
-            if obj.get(k):
-                try:
-                    n = int(str(obj[k]).replace(".", "").replace(",", "").replace("R$", "").strip())
-                    c["preco"] = f"R$ {n:,.0f}".replace(",", ".")
-                except (ValueError, TypeError):
-                    c["preco"] = str(obj[k])
                 break
 
-    # Área, quartos, vagas
-    for k in ["usableAreas", "totalAreas", "area"]:
-        v = obj.get(k)
-        if v:
-            c["area_m2"] = f"{v[0] if isinstance(v, list) else v} m²"
-            break
-    for k in ["bedrooms", "quartos"]:
-        v = obj.get(k)
-        if v:
-            c["quartos"] = str(v[0] if isinstance(v, list) else v)
-            break
-    for k in ["parkingSpaces", "vagas"]:
-        v = obj.get(k)
-        if v:
-            c["vagas"] = str(v[0] if isinstance(v, list) else v)
-            break
+    # Área
+    areas = listing.get("usableAreas")
+    if isinstance(areas, list) and areas:
+        c["area_m2"] = f"{areas[0]} m²"
+    elif listing.get("totalAreas"):
+        t = listing["totalAreas"]
+        if isinstance(t, list) and t:
+            c["area_m2"] = f"{t[0]} m²"
+
+    # Quartos
+    beds = listing.get("bedrooms")
+    if isinstance(beds, list) and beds:
+        c["quartos"] = str(beds[0])
+
+    # Vagas
+    parking = listing.get("parkingSpaces")
+    if isinstance(parking, list) and parking:
+        c["vagas"] = str(parking[0])
 
     # Link
-    link = obj.get("link", {})
-    href = link.get("href", "") if isinstance(link, dict) else (link if isinstance(link, str) else "")
+    href = ""
+    if isinstance(link_data, dict):
+        href = link_data.get("href", "")
     if not href:
-        href = obj.get("url", "") or obj.get("href", "")
-    if not href:
-        lid = obj.get("id") or obj.get("externalId")
+        lid = listing.get("id") or listing.get("externalId")
         if lid:
             href = f"/imovel/{lid}"
     if href and href.startswith("/"):
@@ -301,70 +214,127 @@ def extrair_campos(obj):
     c["link"] = href
 
     # Foto
-    imgs = obj.get("images", [])
-    if isinstance(imgs, list) and imgs:
-        foto = imgs[0]
-        if isinstance(foto, dict):
-            foto = foto.get("url", "") or foto.get("src", "")
-        if foto and not str(foto).startswith("http"):
-            foto = f"https://resizedimgs.zapimoveis.com.br/fit-in/800x600/{foto}"
-        c["foto"] = str(foto)
+    if isinstance(medias, list) and medias:
+        for media in medias:
+            if isinstance(media, dict):
+                url = media.get("url", "")
+                if url:
+                    if not url.startswith("http"):
+                        url = f"https://resizedimgs.zapimoveis.com.br/fit-in/800x600/{url}"
+                    c["foto"] = url
+                    break
 
     return c
 
 
-def extrair_next_data(page):
+# ============================================================
+# FALLBACK: PLAYWRIGHT
+# ============================================================
+def coletar_via_playwright():
+    """Fallback: usa Playwright se a API direta falhar."""
+    logger.info("🌐 Fallback: Playwright...")
+
     try:
-        text = page.evaluate("() => document.querySelector('script#__NEXT_DATA__')?.textContent")
-        if not text:
-            return []
-        data = json.loads(text)
-        return buscar_listings(data)
-    except Exception as e:
-        logger.warning(f"__NEXT_DATA__ erro: {e}")
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.error("Playwright não instalado")
         return []
 
-
-def extrair_html(page):
-    coberturas = []
     try:
-        links = page.evaluate("""
-            () => {
-                const sels = ['a[href*="/imovel/"]', 'a[href*="cobertura"]', 'article a[href]'];
-                const found = new Set();
-                const results = [];
-                for (const sel of sels) {
-                    document.querySelectorAll(sel).forEach(a => {
-                        if (!found.has(a.href)) {
-                            found.add(a.href);
-                            const card = a.closest('div[class*="card"], article, [data-testid]') || a;
-                            results.push({ href: a.href, text: card.innerText.substring(0, 1000) });
-                        }
-                    });
-                }
-                return results;
-            }
-        """)
+        from playwright_stealth import stealth_sync
+        has_stealth = True
+    except ImportError:
+        has_stealth = False
 
-        for link in links:
-            text = link.get("text", "")
-            preco_m = re.search(r'R\$\s*[\d.,]+', text)
-            if preco_m:
-                area_m = re.search(r'(\d+)\s*m²', text)
-                quartos_m = re.search(r'(\d+)\s*(?:quarto|dorm|suíte)', text, re.I)
-                vagas_m = re.search(r'(\d+)\s*(?:vaga|garag)', text, re.I)
-                coberturas.append({
-                    "endereco": text.split("\n")[0][:120].strip(),
-                    "preco": preco_m.group(0),
-                    "area_m2": f"{area_m.group(1)} m²" if area_m else "",
-                    "quartos": quartos_m.group(1) if quartos_m else "",
-                    "vagas": vagas_m.group(1) if vagas_m else "",
-                    "link": link.get("href", ""),
-                    "foto": "",
-                })
-    except Exception as e:
-        logger.error(f"HTML erro: {e}")
+    coberturas = []
+    api_responses = []
+
+    url_zap = (
+        "https://www.zapimoveis.com.br/venda/cobertura/"
+        "rj+rio-de-janeiro+zona-sul+lagoa/"
+        "?transacao=venda"
+        "&onde=%2CRio+de+Janeiro%2CRio+de+Janeiro%2CZona+Sul%2CLagoa"
+        "%2C%2C%2Cneighborhood%2CBR%3ERio+de+Janeiro%3ENULL%3ERio+de+Janeiro"
+        "%3EZona+Sul%3ELagoa%2C-22.96182%2C-43.203077%2C"
+        "&tipos=cobertura_residencial"
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
+            locale="pt-BR",
+        )
+        page = context.new_page()
+        if has_stealth:
+            stealth_sync(page)
+
+        def on_response(response):
+            try:
+                url = response.url.lower()
+                if any(kw in url for kw in ["listing", "glue", "/v2/"]) and response.status == 200:
+                    body = response.text()
+                    if body and len(body) > 200:
+                        api_responses.append({"data": json.loads(body), "size": len(body)})
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        page.goto(url_zap, wait_until="domcontentloaded", timeout=60000)
+
+        if "cloudflare" in page.title().lower():
+            page.wait_for_timeout(10000)
+            if "cloudflare" in page.title().lower():
+                logger.error("  ❌ Cloudflare bloqueou")
+                browser.close()
+                return []
+
+        page.wait_for_timeout(8000)
+        for _ in range(8):
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+            page.wait_for_timeout(2000)
+        page.wait_for_timeout(3000)
+
+        if api_responses:
+            api_responses.sort(key=lambda x: x["size"], reverse=True)
+            for resp in api_responses:
+                found = buscar_listings_recursivo(resp["data"])
+                if found:
+                    coberturas = found
+                    break
+
+        browser.close()
+
+    logger.info(f"🌐 Playwright: {len(coberturas)} coberturas")
     return coberturas
+
+
+def buscar_listings_recursivo(data, depth=0):
+    if depth > 6:
+        return []
+    chaves = ["listings", "results", "searchResults", "items", "data", "search"]
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if any(c in key.lower() for c in chaves):
+                if isinstance(value, list) and value:
+                    parsed = [extrair_campos(item.get("listing", item), item.get("medias"), item.get("link"))
+                              for item in value if isinstance(item, dict)]
+                    parsed = [c for c in parsed if c and c.get("preco")]
+                    if parsed:
+                        return parsed
+                elif isinstance(value, dict):
+                    found = buscar_listings_recursivo(value, depth + 1)
+                    if found:
+                        return found
+            elif isinstance(value, (dict, list)):
+                found = buscar_listings_recursivo(value, depth + 1)
+                if found:
+                    return found
+    return []
 
 
 # ============================================================
@@ -374,7 +344,7 @@ def enviar_pushover(coberturas):
     token = os.environ.get("PUSHOVER_API_TOKEN")
     user = os.environ.get("PUSHOVER_USER_KEY")
     if not token or not user:
-        logger.warning("Pushover não configurado")
+        logger.warning("⚠️ Pushover não configurado")
         return False
 
     agora = datetime.now(FUSO).strftime("%d/%m/%Y %H:%M")
@@ -397,25 +367,23 @@ def enviar_pushover(coberturas):
     ok = True
     for i, m in enumerate(mensagens):
         try:
-            r = requests.post(PUSHOVER_URL, data={
+            r = req.post(PUSHOVER_URL, data={
                 "token": token, "user": user,
                 "message": m, "title": "Coberturas Lagoa",
                 "priority": 0, "html": 1,
             }, timeout=10)
-            if r.status_code == 200:
-                logger.info(f"Pushover {i+1}/{len(mensagens)} ✓")
-            else:
-                logger.error(f"Pushover erro: {r.status_code}")
+            logger.info(f"  Pushover {i+1}/{len(mensagens)}: {r.status_code}")
+            if r.status_code != 200:
                 ok = False
             time.sleep(1)
         except Exception as e:
-            logger.error(f"Pushover: {e}")
+            logger.error(f"  Pushover: {e}")
             ok = False
     return ok
 
 
 # ============================================================
-# SALVAR DADOS
+# SALVAR
 # ============================================================
 def salvar(coberturas):
     DADOS_DIR.mkdir(exist_ok=True)
@@ -428,11 +396,9 @@ def salvar(coberturas):
         "coberturas": coberturas,
     }
 
-    # Arquivo principal (lido pelo Streamlit)
     with open(COBERTURAS_FILE, "w", encoding="utf-8") as f:
         json.dump(resultado, f, ensure_ascii=False, indent=2)
 
-    # Histórico diário
     hist_file = HISTORICO_DIR / f"{agora.strftime('%Y-%m-%d')}.json"
     with open(hist_file, "w", encoding="utf-8") as f:
         json.dump(resultado, f, ensure_ascii=False, indent=2)
@@ -448,14 +414,19 @@ if __name__ == "__main__":
     logger.info("INÍCIO DA COLETA")
     logger.info("=" * 50)
 
-    coberturas = coletar()
+    # Tenta API direta primeiro (rápido, sem browser)
+    coberturas = coletar_via_api()
+
+    # Fallback: Playwright
+    if not coberturas:
+        logger.info("API direta falhou. Tentando Playwright...")
+        coberturas = coletar_via_playwright()
 
     if coberturas:
         salvar(coberturas)
         enviar_pushover(coberturas)
         logger.info(f"✅ {len(coberturas)} coberturas coletadas e salvas")
     else:
-        # Salva resultado vazio para o Streamlit saber que tentou
         salvar([])
         logger.error("❌ Nenhuma cobertura encontrada")
 
