@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-.streamlit/secrets.toml
-debug_*.png
-debug_*.html
-zap_debug/
