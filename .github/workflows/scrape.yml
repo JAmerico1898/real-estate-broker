@@ -1,0 +1,40 @@
+name: Coleta de Coberturas - Lagoa
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependências
+        run: |
+          pip install playwright requests playwright-stealth
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Executar scraper
+        env:
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+        run: python scraper.py
+
+      - name: Commit resultados
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dados/coberturas.json dados/historico/ || true
+          git diff --staged --quiet || git commit -m "🏠 Atualização coberturas $(date -u '+%Y-%m-%d %H:%M')"
+          git push || true
