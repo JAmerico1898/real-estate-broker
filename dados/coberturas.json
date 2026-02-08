@@ -1,0 +1,19 @@
+{
+  "ultima_coleta": null,
+  "total": 0,
+  "coberturas": []
+}
+```
+- Commit
+
+**2. Renomear `gitignore` para `.gitignore`:**
+- Delete o arquivo `gitignore`
+- Crie novo arquivo com nome `.gitignore` (com o ponto)
+- Cole:
+```
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+debug_*.png
+debug_*.html
+zap_debug/
