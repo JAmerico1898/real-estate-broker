@@ -1,16 +1,14 @@
 """
 Scraper de Coberturas - Lagoa, Rio de Janeiro
 ==============================================
-Estratégia:
-  1. Chama a API glue-api.zapimoveis.com.br diretamente (sem browser)
-  2. Se falhar, usa Playwright como fallback
-
-Roda no GitHub Actions. Salva em dados/coberturas.json.
+Estratégia (em ordem):
+  1. API direta com diferentes combinações de headers (3 tentativas)
+  2. Playwright com stealth como fallback
 """
 
 import json
 import os
-import re
+import random
 import time
 import logging
 from datetime import datetime
@@ -19,9 +17,6 @@ from pathlib import Path
 
 import requests as req
 
-# ============================================================
-# CONFIG
-# ============================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -32,10 +27,8 @@ DADOS_DIR = Path("dados")
 HISTORICO_DIR = DADOS_DIR / "historico"
 COBERTURAS_FILE = DADOS_DIR / "coberturas.json"
 
-# API interna do Zap Imóveis (descoberta via interceptação de rede)
 GLUE_API_URL = "https://glue-api.zapimoveis.com.br/v2/listings"
 
-# Parâmetros para coberturas à venda na Lagoa, Rio de Janeiro
 GLUE_API_PARAMS = {
     "business": "SALE",
     "listingType": "USED",
@@ -49,7 +42,7 @@ GLUE_API_PARAMS = {
     "addressPointLon": "-43.203077",
     "addressType": "neighborhood",
     "categoryPage": "RESULT",
-    "size": "100",
+    "size": "36",
     "from": "0",
     "page": "1",
     "includeFields": (
@@ -67,96 +60,123 @@ GLUE_API_PARAMS = {
     ),
 }
 
-GLUE_API_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-    "Referer": "https://www.zapimoveis.com.br/",
-    "Origin": "https://www.zapimoveis.com.br",
-    "x-domain": "www.zapimoveis.com.br",
-}
+# Diferentes perfis de headers para tentar
+HEADER_PROFILES = [
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.zapimoveis.com.br/venda/cobertura/rj+rio-de-janeiro+zona-sul+lagoa/",
+        "Origin": "https://www.zapimoveis.com.br",
+        "x-domain": "www.zapimoveis.com.br",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+        "Referer": "https://www.zapimoveis.com.br/",
+        "Origin": "https://www.zapimoveis.com.br",
+        "x-domain": "www.zapimoveis.com.br",
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Referer": "https://www.zapimoveis.com.br/venda/cobertura/rj+rio-de-janeiro+zona-sul+lagoa/",
+        "Origin": "https://www.zapimoveis.com.br",
+        "x-domain": "www.zapimoveis.com.br",
+    },
+]
 
 
 # ============================================================
 # COLETA VIA API DIRETA
 # ============================================================
 def coletar_via_api():
-    """Chama a API glue-api diretamente."""
-    logger.info("📡 Tentando API direta: glue-api.zapimoveis.com.br...")
+    logger.info("📡 Tentando API direta...")
 
-    todas_coberturas = []
+    for attempt, headers in enumerate(HEADER_PROFILES, 1):
+        logger.info(f"  Tentativa {attempt}/{len(HEADER_PROFILES)}...")
+
+        coberturas = tentar_api_com_headers(headers)
+        if coberturas:
+            return coberturas
+
+        # Espera entre tentativas
+        wait = random.uniform(3, 8)
+        logger.info(f"  Aguardando {wait:.1f}s...")
+        time.sleep(wait)
+
+    logger.warning("📡 Todas tentativas da API falharam")
+    return []
+
+
+def tentar_api_com_headers(headers):
+    todas = []
     page = 1
-    max_pages = 10
 
-    while page <= max_pages:
-        params = {**GLUE_API_PARAMS, "page": str(page), "from": str((page - 1) * 100)}
+    while page <= 10:
+        params = {**GLUE_API_PARAMS, "page": str(page), "from": str((page - 1) * 36)}
 
         try:
-            response = req.get(
-                GLUE_API_URL,
-                params=params,
-                headers=GLUE_API_HEADERS,
-                timeout=30,
-            )
+            r = req.get(GLUE_API_URL, params=params, headers=headers, timeout=30)
+            logger.info(f"    Pág {page}: {r.status_code} ({len(r.content):,}B)")
 
-            logger.info(f"  Página {page}: status {response.status_code} ({len(response.content):,}B)")
+            if r.status_code == 403:
+                logger.warning(f"    Bloqueado (403)")
+                # Tenta logar corpo do erro para diagnosticar
+                try:
+                    logger.info(f"    Corpo 403: {r.text[:300]}")
+                except Exception:
+                    pass
+                return []
 
-            if response.status_code != 200:
-                logger.warning(f"  Resposta não-200: {response.status_code}")
-                break
+            if r.status_code != 200:
+                return []
 
-            data = response.json()
-
-            # Extrai listings
+            data = r.json()
             search = data.get("search", data)
             result = search.get("result", search)
-            listings_data = result.get("listings", [])
-            total_count = result.get("totalCount", 0)
+            listings = result.get("listings", [])
+            total = result.get("totalCount", 0)
 
-            if not listings_data:
-                listings_data = data.get("listings", data.get("results", []))
-
-            if not listings_data:
-                logger.info(f"  Nenhum listing na página {page}")
+            if not listings:
                 break
 
-            logger.info(f"  {len(listings_data)} listings (total no site: {total_count})")
+            logger.info(f"    {len(listings)} listings (total: {total})")
 
-            for item in listings_data:
-                listing = item.get("listing", item)
-                medias = item.get("medias", [])
-                link_data = item.get("link", {})
-
-                c = extrair_campos(listing, medias, link_data)
+            for item in listings:
+                c = extrair_campos(
+                    item.get("listing", item),
+                    item.get("medias", []),
+                    item.get("link", {}),
+                )
                 if c and c.get("preco"):
-                    todas_coberturas.append(c)
+                    todas.append(c)
 
-            if len(listings_data) < 100 or len(todas_coberturas) >= total_count:
+            if len(listings) < 36 or len(todas) >= total:
                 break
 
             page += 1
-            time.sleep(1)
+            time.sleep(random.uniform(1, 3))
 
-        except req.exceptions.Timeout:
-            logger.error("  Timeout na API")
-            break
-        except req.exceptions.ConnectionError:
-            logger.error("  Erro de conexão")
-            break
         except Exception as e:
-            logger.error(f"  Erro: {type(e).__name__}: {e}")
-            break
+            logger.error(f"    Erro: {e}")
+            return []
 
-    logger.info(f"📡 API direta: {len(todas_coberturas)} coberturas")
-    return todas_coberturas
+    return todas
 
 
+# ============================================================
+# EXTRAÇÃO DE CAMPOS
+# ============================================================
 def extrair_campos(listing, medias=None, link_data=None):
-    """Extrai campos de um listing da API glue."""
     if not isinstance(listing, dict):
         return None
 
@@ -169,37 +189,31 @@ def extrair_campos(listing, medias=None, link_data=None):
         c["endereco"] = ", ".join(parts)
 
     # Preço
-    pricing = listing.get("pricingInfos", [])
-    if isinstance(pricing, list):
-        for p in pricing:
-            if isinstance(p, dict) and p.get("businessType") == "SALE":
-                val = p.get("price")
-                if val:
-                    try:
-                        n = int(str(val).replace(".", "").replace(",", ""))
-                        c["preco"] = f"R$ {n:,.0f}".replace(",", ".")
-                    except (ValueError, TypeError):
-                        c["preco"] = f"R$ {val}"
-                break
+    for p in (listing.get("pricingInfos") or []):
+        if isinstance(p, dict) and p.get("businessType") == "SALE":
+            val = p.get("price")
+            if val:
+                try:
+                    n = int(str(val).replace(".", "").replace(",", ""))
+                    c["preco"] = f"R$ {n:,.0f}".replace(",", ".")
+                except (ValueError, TypeError):
+                    c["preco"] = f"R$ {val}"
+            break
 
     # Área
     areas = listing.get("usableAreas")
     if isinstance(areas, list) and areas:
         c["area_m2"] = f"{areas[0]} m²"
-    elif listing.get("totalAreas"):
-        t = listing["totalAreas"]
+    else:
+        t = listing.get("totalAreas")
         if isinstance(t, list) and t:
             c["area_m2"] = f"{t[0]} m²"
 
-    # Quartos
+    # Quartos & vagas
     beds = listing.get("bedrooms")
-    if isinstance(beds, list) and beds:
-        c["quartos"] = str(beds[0])
-
-    # Vagas
-    parking = listing.get("parkingSpaces")
-    if isinstance(parking, list) and parking:
-        c["vagas"] = str(parking[0])
+    c["quartos"] = str(beds[0]) if isinstance(beds, list) and beds else ""
+    park = listing.get("parkingSpaces")
+    c["vagas"] = str(park[0]) if isinstance(park, list) and park else ""
 
     # Link
     href = ""
@@ -214,15 +228,14 @@ def extrair_campos(listing, medias=None, link_data=None):
     c["link"] = href
 
     # Foto
-    if isinstance(medias, list) and medias:
-        for media in medias:
-            if isinstance(media, dict):
-                url = media.get("url", "")
-                if url:
-                    if not url.startswith("http"):
-                        url = f"https://resizedimgs.zapimoveis.com.br/fit-in/800x600/{url}"
-                    c["foto"] = url
-                    break
+    if isinstance(medias, list):
+        for m in medias:
+            if isinstance(m, dict) and m.get("url"):
+                url = m["url"]
+                if not url.startswith("http"):
+                    url = f"https://resizedimgs.zapimoveis.com.br/fit-in/800x600/{url}"
+                c["foto"] = url
+                break
 
     return c
 
@@ -231,13 +244,12 @@ def extrair_campos(listing, medias=None, link_data=None):
 # FALLBACK: PLAYWRIGHT
 # ============================================================
 def coletar_via_playwright():
-    """Fallback: usa Playwright se a API direta falhar."""
     logger.info("🌐 Fallback: Playwright...")
 
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        logger.error("Playwright não instalado")
+        logger.error("Playwright não disponível")
         return []
 
     try:
@@ -246,50 +258,45 @@ def coletar_via_playwright():
     except ImportError:
         has_stealth = False
 
-    coberturas = []
     api_responses = []
 
-    url_zap = (
+    url = (
         "https://www.zapimoveis.com.br/venda/cobertura/"
         "rj+rio-de-janeiro+zona-sul+lagoa/"
-        "?transacao=venda"
-        "&onde=%2CRio+de+Janeiro%2CRio+de+Janeiro%2CZona+Sul%2CLagoa"
-        "%2C%2C%2Cneighborhood%2CBR%3ERio+de+Janeiro%3ENULL%3ERio+de+Janeiro"
-        "%3EZona+Sul%3ELagoa%2C-22.96182%2C-43.203077%2C"
-        "&tipos=cobertura_residencial"
+        "?transacao=venda&tipos=cobertura_residencial"
     )
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
             locale="pt-BR",
         )
-        page = context.new_page()
+        page = ctx.new_page()
         if has_stealth:
             stealth_sync(page)
 
-        def on_response(response):
+        def on_resp(resp):
             try:
-                url = response.url.lower()
-                if any(kw in url for kw in ["listing", "glue", "/v2/"]) and response.status == 200:
-                    body = response.text()
-                    if body and len(body) > 200:
+                u = resp.url.lower()
+                if any(k in u for k in ["listing", "glue", "/v2/"]) and resp.status == 200:
+                    body = resp.text()
+                    if body and len(body) > 500:
                         api_responses.append({"data": json.loads(body), "size": len(body)})
             except Exception:
                 pass
 
-        page.on("response", on_response)
-        page.goto(url_zap, wait_until="domcontentloaded", timeout=60000)
+        page.on("response", on_resp)
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        if "cloudflare" in page.title().lower():
-            page.wait_for_timeout(10000)
+        title = page.title()
+        logger.info(f"  Título: {title}")
+
+        if "cloudflare" in title.lower():
+            page.wait_for_timeout(12000)
             if "cloudflare" in page.title().lower():
-                logger.error("  ❌ Cloudflare bloqueou")
+                logger.error("  ❌ Cloudflare")
                 browser.close()
                 return []
 
@@ -299,10 +306,11 @@ def coletar_via_playwright():
             page.wait_for_timeout(2000)
         page.wait_for_timeout(3000)
 
+        coberturas = []
         if api_responses:
             api_responses.sort(key=lambda x: x["size"], reverse=True)
             for resp in api_responses:
-                found = buscar_listings_recursivo(resp["data"])
+                found = buscar_listings(resp["data"])
                 if found:
                     coberturas = found
                     break
@@ -313,27 +321,26 @@ def coletar_via_playwright():
     return coberturas
 
 
-def buscar_listings_recursivo(data, depth=0):
+def buscar_listings(data, depth=0):
     if depth > 6:
         return []
-    chaves = ["listings", "results", "searchResults", "items", "data", "search"]
     if isinstance(data, dict):
         for key, value in data.items():
-            if any(c in key.lower() for c in chaves):
+            if key.lower() in ("listings", "results", "searchresults", "items", "search", "result"):
                 if isinstance(value, list) and value:
-                    parsed = [extrair_campos(item.get("listing", item), item.get("medias"), item.get("link"))
-                              for item in value if isinstance(item, dict)]
+                    parsed = [extrair_campos(i.get("listing", i), i.get("medias"), i.get("link"))
+                              for i in value if isinstance(i, dict)]
                     parsed = [c for c in parsed if c and c.get("preco")]
                     if parsed:
                         return parsed
                 elif isinstance(value, dict):
-                    found = buscar_listings_recursivo(value, depth + 1)
-                    if found:
-                        return found
+                    f = buscar_listings(value, depth + 1)
+                    if f:
+                        return f
             elif isinstance(value, (dict, list)):
-                found = buscar_listings_recursivo(value, depth + 1)
-                if found:
-                    return found
+                f = buscar_listings(value, depth + 1)
+                if f:
+                    return f
     return []
 
 
@@ -344,7 +351,7 @@ def enviar_pushover(coberturas):
     token = os.environ.get("PUSHOVER_API_TOKEN")
     user = os.environ.get("PUSHOVER_USER_KEY")
     if not token or not user:
-        logger.warning("⚠️ Pushover não configurado")
+        logger.warning("⚠️ Pushover não configurado (defina PUSHOVER_API_TOKEN e PUSHOVER_USER_KEY nos GitHub Secrets)")
         return False
 
     agora = datetime.now(FUSO).strftime("%d/%m/%Y %H:%M")
@@ -364,7 +371,6 @@ def enviar_pushover(coberturas):
         msg += item
     mensagens.append(msg)
 
-    ok = True
     for i, m in enumerate(mensagens):
         try:
             r = req.post(PUSHOVER_URL, data={
@@ -373,13 +379,10 @@ def enviar_pushover(coberturas):
                 "priority": 0, "html": 1,
             }, timeout=10)
             logger.info(f"  Pushover {i+1}/{len(mensagens)}: {r.status_code}")
-            if r.status_code != 200:
-                ok = False
             time.sleep(1)
         except Exception as e:
             logger.error(f"  Pushover: {e}")
-            ok = False
-    return ok
+    return True
 
 
 # ============================================================
@@ -399,8 +402,8 @@ def salvar(coberturas):
     with open(COBERTURAS_FILE, "w", encoding="utf-8") as f:
         json.dump(resultado, f, ensure_ascii=False, indent=2)
 
-    hist_file = HISTORICO_DIR / f"{agora.strftime('%Y-%m-%d')}.json"
-    with open(hist_file, "w", encoding="utf-8") as f:
+    hist = HISTORICO_DIR / f"{agora.strftime('%Y-%m-%d')}.json"
+    with open(hist, "w", encoding="utf-8") as f:
         json.dump(resultado, f, ensure_ascii=False, indent=2)
 
     logger.info(f"💾 Salvo em {COBERTURAS_FILE}")
@@ -414,18 +417,16 @@ if __name__ == "__main__":
     logger.info("INÍCIO DA COLETA")
     logger.info("=" * 50)
 
-    # Tenta API direta primeiro (rápido, sem browser)
     coberturas = coletar_via_api()
 
-    # Fallback: Playwright
     if not coberturas:
-        logger.info("API direta falhou. Tentando Playwright...")
+        logger.info("API falhou. Tentando Playwright...")
         coberturas = coletar_via_playwright()
 
     if coberturas:
         salvar(coberturas)
         enviar_pushover(coberturas)
-        logger.info(f"✅ {len(coberturas)} coberturas coletadas e salvas")
+        logger.info(f"✅ {len(coberturas)} coberturas")
     else:
         salvar([])
         logger.error("❌ Nenhuma cobertura encontrada")
