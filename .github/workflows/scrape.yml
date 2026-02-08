@@ -2,7 +2,11 @@ name: Coleta de Coberturas - Lagoa
 
 on:
   schedule:
+    # 9:00 BRT = 12:00 UTC
     - cron: '0 12 * * *'
+    # Retentativas: 9:15 e 9:30 BRT
+    - cron: '15 12 * * *'
+    - cron: '30 12 * * *'
   workflow_dispatch:
 
 jobs:
@@ -14,24 +18,46 @@ jobs:
       - name: Checkout repositório
         uses: actions/checkout@v4
 
+      - name: Verificar se já coletou hoje
+        id: check
+        run: |
+          TODAY=$(TZ="America/Sao_Paulo" date +%Y-%m-%d)
+          if [ -f "dados/historico/${TODAY}.json" ]; then
+            TOTAL=$(python3 -c "import json; d=json.load(open('dados/historico/${TODAY}.json')); print(d.get('total',0))")
+            if [ "$TOTAL" -gt "0" ]; then
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "✅ Já coletou $TOTAL coberturas hoje. Pulando."
+            else
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "Coleta anterior falhou. Tentando novamente."
+            fi
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Primeira coleta do dia."
+          fi
+
       - name: Setup Python
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Instalar dependências
+        if: steps.check.outputs.skip != 'true'
         run: |
           pip install playwright requests playwright-stealth
           playwright install chromium
           playwright install-deps chromium
 
       - name: Executar scraper
+        if: steps.check.outputs.skip != 'true'
         env:
           PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
           PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
         run: python scraper.py
 
       - name: Commit resultados
+        if: steps.check.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
